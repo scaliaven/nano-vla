@@ -1,0 +1,9 @@
+torch>=2.1
+numpy
+transformers>=4.45
+h5py
+tqdm
+Pillow
+
+# Sim-only (lazy-imported in eval_libero.py); install separately if you want to run eval:
+#   https://github.com/Lifelong-Robot-Learning/LIBERO  (pulls in robosuite, mujoco)
