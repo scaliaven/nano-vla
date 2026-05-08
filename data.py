@@ -1,14 +1,22 @@
-"""Dataset + collator for the flat .npz format produced by convert_libero.py.
+"""Datasets + collator. Two backends share the same per-sample interface:
 
-The dataset returns per-sample uint8 frames + raw float actions; the
-Collator handles instruction tokenization (LM tokenizer) and action
-discretization (ActionTokenizer's vocab-tail mapping) at batch time, so
-NanoVLA.forward() receives the model-shaped tensors it expects.
+1. TrajectoryDataset      reads the flat .npz layout from convert_libero.py /
+                          convert_libero_lerobot.py. Fast: mmap'd npz, one
+                          frame paged in per sample. Recommended for training.
+2. LeRobotTrajectoryDataset reads a LeRobot v2.x dataset directly (parquet +
+                          mp4) with no offline conversion step. Convenient but
+                          slower: every fresh episode triggers a sequential mp4
+                          decode (AV1 has sparse keyframes; per-frame seek is
+                          expensive). A small per-worker LRU softens the cost.
 
-Splitting the work this way keeps both halves small and lets data.py stay
-agnostic of model.py — anything with the same tokenizer / action_tokenizer
-duck-typed interface plugs in.
+Both expose `.action_q01`/`.action_q99` so train.py doesn't need stats.json
+for the LeRobot path. `make_dataset(data_dir, ...)` auto-detects which
+backend to use based on which metadata files are present.
+
+The Collator is unchanged across backends — it consumes the same per-sample
+dict (primary, [wrist], instruction, actions).
 """
+import functools
 import json
 import random
 from pathlib import Path
@@ -39,6 +47,9 @@ class TrajectoryDataset(Dataset):
         self.episodes = list(self.index.keys())
         self.lengths = [self.index[k]["length"] for k in self.episodes]
         self.num_samples_per_epoch = num_samples_per_epoch or sum(self.lengths)
+        stats = json.loads((self.data_dir / "stats.json").read_text())
+        self.action_q01 = stats["action_q01"]
+        self.action_q99 = stats["action_q99"]
 
     def __len__(self):
         return self.num_samples_per_epoch
@@ -110,6 +121,125 @@ class Collator:
             batch["wrist"] = torch.from_numpy(
                 np.stack([s["wrist"] for s in samples], axis=0))
         return batch
+
+
+class LeRobotTrajectoryDataset(Dataset):
+    """Read a LeRobot v2.x dataset directly — no offline conversion.
+
+    Layout expected:
+        <data_dir>/meta/info.json           # data_path/video_path templates, chunks_size
+        <data_dir>/meta/episodes.jsonl      # per-episode length + tasks
+        <data_dir>/data/chunk-XXX/episode_NNNNNN.parquet
+        <data_dir>/videos/chunk-XXX/<key>/episode_NNNNNN.mp4
+
+    Per-sample dict matches TrajectoryDataset exactly, so the Collator is shared.
+
+    Performance note: AV1-coded mp4s don't seek cheaply, so we decode whole
+    episodes sequentially and cache them per-worker via lru_cache. With
+    length-weighted episode sampling and N≈400 episodes, the cache rarely hits;
+    if you train for real, run convert_libero_lerobot.py once and use the .npz
+    path instead — it's ~10× faster.
+
+    Resize-only (no [::-1]): LeRobot LIBERO mp4s are already upright, so the
+    pixels here match what convert_libero.resize_views produces from HDF5.
+    """
+
+    PRIMARY_KEY = "observation.images.image"
+    WRIST_KEY = "observation.images.wrist_image"
+
+    def __init__(self, data_dir, chunk_size: int = 8, use_wrist_camera: bool = False,
+                 image_size: int = 224, num_samples_per_epoch: int | None = None,
+                 cache_episodes: int = 4):
+        self.data_dir = Path(data_dir)
+        self.chunk_size = chunk_size
+        self.use_wrist_camera = use_wrist_camera
+        self.image_size = image_size
+        self.info = json.loads((self.data_dir / "meta" / "info.json").read_text())
+
+        self.episode_meta = []  # list of {ep_idx, length, instruction}
+        with (self.data_dir / "meta" / "episodes.jsonl").open() as f:
+            for line in f:
+                em = json.loads(line)
+                self.episode_meta.append({
+                    "ep_idx": em["episode_index"],
+                    "length": em["length"],
+                    "instruction": em["tasks"][0],
+                })
+        self.lengths = [em["length"] for em in self.episode_meta]
+        self.num_samples_per_epoch = num_samples_per_epoch or sum(self.lengths)
+        self.action_q01, self.action_q99 = self._compute_action_quantiles()
+
+        # Per-instance lru caches — each DataLoader worker forks its own copy,
+        # so caches don't share across workers (which is what we want).
+        self._decode_view = functools.lru_cache(maxsize=cache_episodes)(self._decode_view_uncached)
+        self._read_actions = functools.lru_cache(maxsize=cache_episodes)(self._read_actions_uncached)
+
+    def __len__(self):
+        return self.num_samples_per_epoch
+
+    def _ep_paths(self, ep_idx: int):
+        chunk = ep_idx // self.info["chunks_size"]
+        fmt = {"episode_chunk": chunk, "episode_index": ep_idx}
+        pq = self.data_dir / self.info["data_path"].format(**fmt)
+        prim = self.data_dir / self.info["video_path"].format(video_key=self.PRIMARY_KEY, **fmt)
+        wrist = self.data_dir / self.info["video_path"].format(video_key=self.WRIST_KEY, **fmt)
+        return pq, prim, wrist
+
+    def _read_actions_uncached(self, ep_idx: int) -> np.ndarray:
+        import pyarrow.parquet as pq_mod
+        pq_path, _, _ = self._ep_paths(ep_idx)
+        col = pq_mod.read_table(pq_path, columns=["action"])["action"]
+        return np.stack(list(col.to_numpy())).astype(np.float32)
+
+    def _decode_view_uncached(self, ep_idx: int, view: str) -> np.ndarray:
+        import imageio.v3 as iio
+        from PIL import Image as PILImage
+        _, prim, wrist = self._ep_paths(ep_idx)
+        mp4 = prim if view == "primary" else wrist
+        size = self.image_size
+        frames = []
+        for f in iio.imiter(mp4):
+            if f.shape[:2] != (size, size):
+                f = np.asarray(PILImage.fromarray(f).resize((size, size), PILImage.BILINEAR))
+            frames.append(f)
+        return np.stack(frames).astype(np.uint8)
+
+    def _compute_action_quantiles(self):
+        """One-time scan over all parquets. Cheap: only reads the action column."""
+        A = np.concatenate([self._read_actions_uncached(em["ep_idx"])
+                            for em in self.episode_meta], axis=0)
+        return np.quantile(A, 0.01, axis=0).tolist(), np.quantile(A, 0.99, axis=0).tolist()
+
+    def __getitem__(self, idx):
+        # Ignore idx — sample (episode, t) ourselves, length-weighted.
+        em = random.choices(self.episode_meta, weights=self.lengths, k=1)[0]
+        ep_idx, T, instr = em["ep_idx"], em["length"], em["instruction"]
+        t = random.randrange(T)
+
+        actions = self._read_actions(ep_idx)[t : t + self.chunk_size].copy()
+        primary = self._decode_view(ep_idx, "primary")[t].copy()
+        sample = {"primary": primary, "instruction": instr, "actions": actions}
+        if self.use_wrist_camera:
+            sample["wrist"] = self._decode_view(ep_idx, "wrist")[t].copy()
+
+        if len(actions) < self.chunk_size:
+            pad = np.repeat(actions[-1:], self.chunk_size - len(actions), axis=0)
+            sample["actions"] = np.concatenate([actions, pad], axis=0)
+        return sample
+
+
+def make_dataset(data_dir, chunk_size: int = 8, use_wrist_camera: bool = False,
+                 image_size: int = 224) -> Dataset:
+    """Pick the right dataset class based on what's in `data_dir`.
+
+    LeRobot layout has meta/info.json; the flat-npz layout has stats.json + index.json.
+    """
+    p = Path(data_dir)
+    if (p / "meta" / "info.json").exists():
+        return LeRobotTrajectoryDataset(p, chunk_size=chunk_size,
+                                        use_wrist_camera=use_wrist_camera,
+                                        image_size=image_size)
+    return TrajectoryDataset(p, chunk_size=chunk_size, use_wrist_camera=use_wrist_camera)
 
 
 def make_dataloader(dataset, collator, batch_size: int, num_workers: int = 4,

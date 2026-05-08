@@ -1,8 +1,25 @@
 # nanoVLA
 
-A single-file-readable Vision-Language-Action model in the spirit of [nanoGPT](https://github.com/karpathy/nanoGPT). **~600 lines of Python** total — no Trainer / Lightning / Accelerate, no Hydra, no TFDS / RLDS / OXE pipeline. One `@dataclass` config at the top of `train.py`. Trains on LIBERO-Spatial in a few GPU-hours and gets to roughly **70–80% success** on the canonical eval.
+A single-file-readable Vision-Language-Action model in the spirit of [nanoGPT](https://github.com/karpathy/nanoGPT). **~900 lines of Python** total (six files, see [File layout](#file-layout)) — no Trainer / Lightning / Accelerate, no Hydra, no TFDS / RLDS / OXE pipeline. One `@dataclass` config at the top of `train.py`. Trains on LIBERO-Spatial in a few GPU-hours and gets to roughly **70–80% success** on the canonical eval.
 
-This is a **teaching artifact and research substrate**, not a SOTA chase. The product is clarity. If a feature would push us past the line budget, it goes in the [v2 roadmap](#v2-roadmap) instead.
+This is a **teaching artifact and research substrate**, not a SOTA chase. The product is clarity. If a feature would push the line count significantly higher, it goes in the [v2 roadmap](#v2-roadmap) instead.
+
+---
+
+## Contents
+
+- [Architecture](#architecture-in-one-paragraph)
+- [File layout](#file-layout)
+- [Data format](#data-format) — flat `.npz` contract, plus reading LeRobot v2.x directly
+- [Quickstart](#quickstart)
+- [The four axes of VLA design space](#the-four-axes-of-vla-design-space) — action repr, action head, backbone coupling, temporal structure
+- [Per-system placement](#per-system-placement) — nanoVLA vs OpenVLA / MiniVLA / π0 / π0-FAST / GR00T N1 / RDT-1B
+- [Where nanoVLA fits](#where-nanovla-fits)
+- [What nanoVLA is NOT](#what-nanovla-is-not)
+- [v2 roadmap](#v2-roadmap)
+- [Expected numbers](#expected-numbers)
+- [Common debugging notes](#common-debugging-notes)
+- [References](#references)
 
 ---
 
@@ -14,13 +31,14 @@ A single SigLIP-base patch-16-224 vision tower → 2-layer GELU MLP projector (L
 
 | File | Functional / Total | What it does |
 |---|---:|---|
-| [`model.py`](./model.py) | 169 / 301 | Vision tower, projector, action tokenizer, `NanoVLA` module, inference |
-| [`data.py`](./data.py) | 86 / 134 | `TrajectoryDataset` over the flat .npz format, `Collator` |
-| [`train.py`](./train.py) | 161 / 217 | `@dataclass` config, raw PyTorch loop, optional DDP / wandb |
-| [`convert_libero.py`](./convert_libero.py) | 78 / 121 | LIBERO HDF5 → flat .npz episodes + `index.json` + `stats.json` |
-| [`eval_libero.py`](./eval_libero.py) | 99 / 150 | LIBERO sim rollout harness, success rate metric |
+| [`model.py`](./model.py) | 217 / 289 | Vision tower, projector, action tokenizer, `NanoVLA` module, inference |
+| [`data.py`](./data.py) | 209 / 260 | `TrajectoryDataset` (flat .npz), `LeRobotTrajectoryDataset` (parquet+mp4), `Collator`, `make_dataset` factory |
+| [`train.py`](./train.py) | 178 / 225 | `@dataclass` config, raw PyTorch loop, optional DDP / wandb |
+| [`convert_libero.py`](./convert_libero.py) | 98 / 119 | LIBERO HDF5 → flat .npz episodes + `index.json` + `stats.json` |
+| [`convert_libero_lerobot.py`](./convert_libero_lerobot.py) | 111 / 135 | LeRobot v2.x dataset → same flat .npz format (recommended for LeRobot data) |
+| [`eval_libero.py`](./eval_libero.py) | 108 / 133 | LIBERO sim rollout harness, success rate metric |
 
-"Functional" counts exclude blank lines, comments, and docstrings. Total project: **593 functional / ~1000 total**.
+"Functional" counts exclude blank lines and comment-only lines. Total project: **921 functional / 1161 total**.
 
 ## Data format
 
@@ -38,9 +56,14 @@ data/libero_spatial/
   stats.json          # dataset-wide action q01/q99 (for the discretizer), num_bins, image_size
 ```
 
-This is the canonical contract. To train on a non-LIBERO dataset, write your own conversion script that produces the same files; nothing in `model.py`, `data.py`, or `train.py` is LIBERO-specific.
+This is the canonical contract. To train on a non-LIBERO dataset, write your own conversion script that produces the same files — nothing in `model.py`, `data.py`, or `train.py` is LIBERO-specific. Files are **uncompressed** (`np.savez`) so the dataloader can `mmap_mode='r'` and page in only one frame per sample; compressed npz would force whole-episode decompression per `__getitem__` (~10× slower). The disk cost is real (LIBERO-Spatial is ~22 GB vs ~3 GB compressed).
 
-`.npz` files are **uncompressed** (`np.savez`, not `np.savez_compressed`) so that the dataloader can `mmap_mode='r'` and only page in the bytes for one frame per sample. The training-throughput cost of compressed npz is ~10× because every `__getitem__` would have to decompress the entire episode just to read one timestep. Disk overhead is the price: LIBERO-Spatial is ~22 GB on disk in this format vs ~3 GB compressed.
+### Two ways to use a LeRobot dataset
+
+Many recent datasets (including a port of LIBERO) ship in [LeRobot v2.x](https://github.com/huggingface/lerobot) layout (parquet + mp4). nanoVLA supports it through two paths and `train.py` auto-detects which one to use:
+
+- **Recommended — convert once:** run `python convert_libero_lerobot.py --src <lerobot_root> --out data/<name>` to emit the same flat `.npz` contract. Training then uses the fast mmap'd `TrajectoryDataset`.
+- **Convenient — read directly:** point `--data-dir` at the LeRobot root and `make_dataset` returns a `LeRobotTrajectoryDataset` that decodes mp4 frames on-the-fly with a per-worker LRU cache. No conversion step, but slower (AV1 has sparse keyframes), so prefer this for prototyping rather than long runs.
 
 ## Quickstart
 
@@ -49,14 +72,17 @@ This is the canonical contract. To train on a non-LIBERO dataset, write your own
 pip install torch torchvision transformers einops numpy pillow tqdm h5py
 # optional: wandb (logging), libero (eval)
 
-# 1. convert LIBERO HDF5 demos to nanoVLA's flat .npz format
+# 1. convert demos to the flat .npz format
+#    LIBERO HDF5:
 python convert_libero.py --src /path/to/libero_spatial_no_noops --out data/libero_spatial
+#    or LeRobot v2.x:
+python convert_libero_lerobot.py --src /path/to/lerobot_dataset --out data/<name>
 
 # 2. smoke-test the eval harness with a random policy (will not succeed,
 #    but verifies the rollout loop works before any training time is spent)
 python eval_libero.py --policy random --suite libero_spatial --num-trials 2
 
-# 3. train (single GPU)
+# 3. train (single GPU). --data-dir can be either a flat-npz dir or a LeRobot root.
 python train.py --data-dir data/libero_spatial --steps 50000 --batch-size 8
 
 # 3'. or DDP
@@ -72,23 +98,23 @@ Every field in `TrainConfig` (top of `train.py`) is also a CLI flag. Booleans be
 
 ## The four axes of VLA design space
 
-Vision-Language-Action models look superficially similar — a vision encoder, a language model, something that emits robot actions — but the design space underneath is wide, and most published systems differ on several axes at once. This section names four axes that cleanly separate the design choices, and places seven recent systems on each. nanoVLA itself is one specific point in this space, chosen for **pedagogical clarity rather than performance**: the goal is that you can swap any single axis without rewriting the rest of the codebase.
+VLA models look superficially similar but differ on several axes at once. The four below cleanly separate the design choices; nanoVLA picks one point on each, chosen so any single axis can be swapped without rewriting the rest of the codebase.
 
 ### 1. Action representation
 
-How the continuous robot action signal (typically 6-DoF or 7-DoF EE delta + gripper) is encoded for the model to consume or emit. The main families are: **per-dim uniform discrete bins** (each action dim independently quantized into N buckets, usually 256); **FAST / DCT tokens** (compress an action chunk via DCT + BPE into a short variable-length token sequence); **continuous via flow matching or diffusion** (no discretization; the model emits real-valued vectors via an iterative denoiser); and **VQ codebook tokens** (a learned vector quantizer over action chunks). The choice trades off sample efficiency, action smoothness, sequence length, and how cleanly actions slot into a language model's token stream.
+How the continuous robot action signal (typically 6-DoF or 7-DoF EE delta + gripper) is encoded. The main families are **per-dim uniform discrete bins**, **FAST / DCT tokens** (DCT + BPE over a chunk), **continuous via flow matching or diffusion**, and **VQ codebook tokens**. The choice trades off sample efficiency, action smoothness, sequence length, and how cleanly actions slot into a language model's token stream.
 
 ### 2. Action head
 
-What module actually produces the action numbers from the backbone's hidden states. Options include: **the LM head reused via a vocab-tail token mapping** (cheapest — pick N existing tokens to mean "action bin k", so the LM's softmax already covers them); a **separate small MLP or transformer regressor** on top of the backbone; a **diffusion or flow-matching expert** (a separate denoising network conditioned on backbone features); or a dedicated **"action expert" sub-network** that shares attention with the VLM but has its own parameters. The action head's complexity often dominates whether the system can express multi-modal action distributions.
+What module produces the action numbers from the backbone's hidden states: **the LM head reused via a vocab-tail token mapping** (cheapest), a **separate MLP or transformer regressor**, a **diffusion or flow-matching expert** conditioned on backbone features, or a dedicated **"action expert" sub-network** that shares attention with the VLM but has its own parameters. The head's complexity often dominates whether the system can express multi-modal action distributions.
 
 ### 3. Backbone coupling
 
-How vision, language, and action representations interact inside the network. A **single unified transformer** processes image patches, text tokens, and action tokens in one sequence (OpenVLA-style). A **frozen VLM + adapter** keeps a pretrained VLM fixed and learns only a small bridge to actions. A **VLM with cross-attention into a separate action expert** (the π0 pattern) lets a heavy VLM feed conditioning into a smaller, faster action network. An **encoder-decoder split** uses one stack to encode observations and a different stack — often a diffusion transformer — to decode actions. Coupling determines what's frozen vs trained, and whether action inference requires running the full VLM at every control step.
+How vision, language, and action representations interact. A **single unified transformer** processes patches, text, and action tokens in one sequence (OpenVLA). A **frozen VLM + adapter** learns only a small bridge to actions. A **VLM with cross-attention into a separate action expert** (π0) lets a heavy VLM feed a smaller, faster action network. An **encoder-decoder split** uses different stacks for observation encoding and action decoding. Coupling determines what's frozen vs trained, and whether action inference requires running the full VLM at every control step.
 
 ### 4. Temporal structure
 
-How the model handles time. **Single-step** predicts only the next action given the current observation. **Action chunking with chunk size K** predicts K future actions in one forward pass, then executes some or all of them open-loop before re-querying — this amortizes inference cost and tends to smooth trajectories. **History-conditioned** input feeds the model the last H observations or actions as context. Most modern VLAs chunk; the choice of K (commonly 8–50) interacts strongly with control frequency and action representation.
+How the model handles time. **Single-step** predicts only the next action. **Action chunking with chunk size K** predicts K future actions per forward pass and executes them open-loop before re-querying, amortizing inference cost and smoothing trajectories. **History-conditioned** input feeds the last H observations as context. Most modern VLAs chunk; K (commonly 8–50) interacts strongly with control frequency and action representation.
 
 ## Per-system placement
 
@@ -106,29 +132,27 @@ How the model handles time. **Single-step** predicts only the next action given 
 
 ### Notes on each system
 
-- **nanoVLA** *(this repo)*. The smallest readable point in the OpenVLA lineage. Keeps OpenVLA's per-dim 256-bin discretization and "actions are just LM tokens" trick, but (a) shrinks the LM to Qwen2.5-0.5B, (b) uses a single SigLIP-base tower behind a 2-layer GELU MLP projector, and (c) adds OpenVLA-OFT-style action chunking with K=8. Crucially, no embeddings are added and no vocab is resized: the **last** 256 tokens of Qwen2.5's existing vocabulary are reinterpreted as action bins, so the LM head doubles as the action head.
-- **OpenVLA** (Kim et al., 2024). The reference point for the discrete-AR family: Prismatic-style VLM (SigLIP + DINOv2, Llama-2-7B) fine-tuned on OXE, with 256 rarely-used Llama tokens overwritten to mean uniform action bins. Predicts a single 7-DoF action per forward pass; later work (OpenVLA-OFT) adds chunking and parallel decoding.
-- **MiniVLA** (Stanford, Belkhale et al., 2024). Small-scale VLA aimed at making OpenVLA-style training tractable on modest hardware. There are at least two related Stanford small-VLA efforts; details on whether actions are per-dim discrete or VQ-tokenized vary by reference — verify in the MiniVLA paper/repo before citing specifics.
-- **π0** (Black et al., 2024). Introduces a flow-matching "action expert" that shares attention with a PaliGemma-class VLM but has its own weights, so the expensive VLM can run at a lower rate while the lighter expert produces continuous action chunks at control rate. The continuous representation removes quantization artifacts and naturally handles multi-modal action distributions.
-- **π0-FAST** (Pertsch et al., 2025). Replaces π0's flow-matching expert with an autoregressive LM head over **FAST tokens**: take an action chunk, apply a DCT to compress its low-frequency structure, then BPE-encode the result into a short variable-length token sequence. This recovers the "actions are just tokens" simplicity of OpenVLA while avoiding the long flat sequences that per-dim binning produces for long chunks.
-- **GR00T N1** (NVIDIA, 2025). Humanoid foundation model with an explicit System-1 / System-2 split inspired by dual-process cognition: a slower VLM ("System 2") produces high-level latent conditioning, and a faster diffusion transformer ("System 1") consumes that conditioning and denoises continuous actions at control rate. Verify the exact diffusion-head architecture and chunk size in the GR00T N1 tech report.
-- **RDT-1B** (Liu et al., 2024). A ~1B-parameter diffusion transformer specialized for bimanual manipulation, with a unified action space across robots. Different summaries describe RDT differently — verify whether the diffusion module is a separate head conditioned on a frozen VLM, or whether the whole transformer is itself the denoiser with vision/language injected as conditioning tokens.
+- **nanoVLA** *(this repo)*. The smallest readable point in the OpenVLA lineage: Qwen2.5-0.5B + SigLIP-base + 2-layer MLP projector, with OpenVLA-OFT-style chunking (K=8). The last 256 tokens of Qwen2.5's vocab are reinterpreted as action bins — no new embeddings, no vocab resize.
+- **OpenVLA** (Kim et al., 2024). The reference point for the discrete-AR family: Prismatic VLM (SigLIP + DINOv2, Llama-2-7B) with 256 rarely-used Llama tokens overwritten as action bins. Single-step; later OpenVLA-OFT adds chunking and parallel decoding.
+- **MiniVLA** (Stanford, Belkhale et al., 2024). Small-scale VLA aimed at making OpenVLA-style training tractable on modest hardware. Whether actions are per-dim discrete or VQ-tokenized varies by reference — verify in the paper/repo.
+- **π0** (Black et al., 2024). A flow-matching "action expert" shares attention with a PaliGemma-class VLM but has its own weights, so the expensive VLM can run at a lower rate while the lighter expert produces continuous chunks at control rate.
+- **π0-FAST** (Pertsch et al., 2025). Replaces π0's flow-matching expert with an autoregressive LM head over **FAST tokens** (DCT + BPE over an action chunk), recovering the "actions are just tokens" simplicity without the long flat sequences of per-dim binning.
+- **GR00T N1** (NVIDIA, 2025). Humanoid model with an explicit System-1 / System-2 split: a slower VLM produces latent conditioning, and a faster diffusion transformer denoises continuous actions at control rate. Verify exact head architecture and chunk size in the tech report.
+- **RDT-1B** (Liu et al., 2024). A ~1B-parameter diffusion transformer for bimanual manipulation with a unified action space. Verify whether the diffusion module is a separate head or the whole transformer is the denoiser.
 
 ## Where nanoVLA fits
 
-On all four axes, nanoVLA picks the simplest published option: per-dim uniform discrete bins, the LM head reused via vocab-tail mapping, a single unified transformer, and action chunking with a small K. That puts it squarely in the OpenVLA lineage, **not** the π0 / GR00T / RDT lineage — there is no diffusion network, no flow matching, no separate action expert, and no new embeddings to manage. The payoff is that each axis becomes a clean teaching exercise: swap the discretizer for FAST tokens to study representation; replace the LM head with an MLP regressor or a tiny diffusion head to study action heads; freeze the VLM and add a cross-attended expert to study coupling; vary K from 1 to 32 to study temporal structure. The whole model is small enough (~600 lines, ~0.5B params) that any one of these swaps fits in a single readable diff.
+On all four axes, nanoVLA picks the simplest published option: per-dim uniform discrete bins, the LM head reused via vocab-tail mapping, a single unified transformer, and small-K action chunking. That puts it squarely in the OpenVLA lineage, **not** the π0 / GR00T / RDT lineage — no diffusion, no flow matching, no separate action expert, no new embeddings. The payoff is that each axis becomes a clean swap: representation, head, coupling, or K can be studied one at a time. At ~900 lines and ~0.5B params, any one of these swaps fits in a single readable diff.
 
 ---
 
 ## What nanoVLA is NOT
 
-- **Not SOTA.** π0, GR00T N1, RDT, π0-FAST, and the OpenVLA-OFT line all beat us on every benchmark we'd run. We are explicitly trading capability for clarity.
-- **Not a foundation model.** We don't pretrain on Open-X-Embodiment or any multi-robot corpus. nanoVLA is fine-tuned from a base VLM on one robot dataset at a time.
-- **Not Open-X compatible.** No TFDS / RLDS / OXE pipeline, by design. Bring-your-own-data is the flat .npz format described above; you write your own conversion script per dataset.
-- **Not a deployment-ready stack.** Real-robot deployment works in principle, but we don't ship calibration, safety envelopes, async control, or hardware drivers. Inference is synchronous PyTorch.
-- **Not feature-complete.** No multi-camera fusion (dual view exists in the data path but is uncoupled — concatenated patches), no proprioception input, no language-conditioned reset behavior, no eval-on-OOD-objects harness.
-
-If you need any of these, see the [v2 roadmap](#v2-roadmap) or use one of the bigger systems in the table above.
+- **Not SOTA.** π0, GR00T N1, RDT, π0-FAST, and OpenVLA-OFT all beat us — we trade capability for clarity.
+- **Not a foundation model.** No Open-X / multi-robot pretraining; fine-tuned from a base VLM on one dataset at a time.
+- **Not Open-X compatible.** No TFDS / RLDS / OXE pipeline, by design — bring your own data via the flat .npz format.
+- **Not a deployment-ready stack.** No calibration, safety envelopes, async control, or hardware drivers; inference is synchronous PyTorch.
+- **Not feature-complete.** No multi-camera fusion (dual view is uncoupled), no proprioception input, no OOD-eval harness.
 
 ## v2 roadmap
 
@@ -167,7 +191,7 @@ TBD.
 
 ## References
 
-Listed in alphabetical order. arXiv IDs given where the README authors are confident; verify before citing in academic work.
+arXiv IDs given where the README authors are confident; verify before citing in academic work.
 
 - Belkhale et al. *MiniVLA*. 2024. (verify exact title and arXiv id)
 - Black et al. *π0: A Vision-Language-Action Flow Model for General Robot Control*. arXiv:2410.24164, 2024.

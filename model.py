@@ -54,11 +54,7 @@ class VLAConfig:
 
 
 def preprocess_image(arr_uint8: torch.Tensor, image_size: int) -> torch.Tensor:
-    """uint8 (B,H,W,3) -> float32 (B,3,image_size,image_size), SigLIP-normalized.
-
-    Resize is a no-op when input is already at image_size (the common case
-    after convert_libero.py); kept for safety with non-canonical inputs.
-    """
+    """uint8 (B,H,W,3) -> float32 (B,3,image_size,image_size), SigLIP-normalized."""
     x = arr_uint8.permute(0, 3, 1, 2).float() / 255.0
     if x.shape[-1] != image_size or x.shape[-2] != image_size:
         x = F.interpolate(x, size=image_size, mode="bilinear", align_corners=False)

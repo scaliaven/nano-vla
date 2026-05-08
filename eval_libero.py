@@ -1,21 +1,9 @@
-"""LIBERO sim rollout harness for nanoVLA. Reports success rate.
+"""LIBERO sim rollout harness. Reports success rate.
 
-Built BEFORE training so action-tokenizer / model-interface bugs surface early.
-Run with --policy random against the real sim — it will not succeed at tasks,
-but it exercises the full pipeline (env reset, image preprocessing, chunk
-execution, success detection).
-
-Policy interface (model.py conforms to this):
+Policy interface (Contract 2):
     policy.chunk_size: int
-    policy.predict(images, instruction) -> np.ndarray of shape (chunk_size, 7)
-        images is a dict with at least 'primary' (and optionally 'wrist'),
-        each (image_size, image_size, 3) uint8.
-
-Eval executes the chunk OPEN-LOOP, then calls predict() again.
-
-Usage:
-    python eval_libero.py --policy random  --suite libero_spatial --num-trials 5
-    python eval_libero.py --policy nano-vla --ckpt out/ckpt.pt --suite libero_spatial
+    policy.predict(images, instruction) -> (chunk_size, 7) np.float32
+The chunk is executed open-loop, then predict() is called again.
 """
 import argparse
 import json

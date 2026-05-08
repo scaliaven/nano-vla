@@ -1,23 +1,24 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project goal
 
-nanoVLA is a **teaching artifact** — a single-file-readable Vision-Language-Action model in the spirit of nanoGPT. The product is *clarity*, not SOTA. The whole project is constrained to ~600 functional lines; features that push past that go in the v2 roadmap (`README.md#v2-roadmap`), not into the codebase. When proposing changes, weigh line-count and readability cost against pedagogical value. Don't introduce abstractions, frameworks (Trainer/Lightning/Accelerate/Hydra), or generality that the task doesn't already require.
+nanoVLA is a **teaching artifact** — a single-file-readable Vision-Language-Action model in the spirit of nanoGPT. The product is *clarity*, not SOTA. Line-count is a strong constraint: v1 (HDF5 LIBERO) was ~600 functional lines, adding LeRobot v2.x brought it to ~920; treat that as the working budget — features that push much past it go in the v2 roadmap (`README.md#v2-roadmap`). Weigh line-count and readability cost against pedagogical value. Don't introduce abstractions or frameworks (Trainer/Lightning/Accelerate/Hydra) that the task doesn't already require.
 
 ## Commands
 
 ```bash
-# 1. Convert LIBERO HDF5 demos -> flat .npz (one-time per dataset)
+# 1. Convert demos -> flat .npz (one-time per dataset).
+# LIBERO HDF5:
 python convert_libero.py --src /path/to/libero_spatial_no_noops --out data/libero_spatial
-# fast smoke test:
+# LeRobot v2.x (parquet + mp4):
+python convert_libero_lerobot.py --src /path/to/lerobot_root --out data/<name>
+# fast smoke test (HDF5):
 python convert_libero.py --src ... --out ... --max-demos-per-task 1
 
 # 2. Smoke-test the eval harness without a trained model
 python eval_libero.py --policy random --suite libero_spatial --num-trials 2
 
-# 3. Train (single GPU)
+# 3. Train (single GPU). --data-dir auto-detects flat-npz vs LeRobot layout.
 python train.py --data-dir data/libero_spatial --steps 50000 --batch-size 8
 # DDP via torchrun (nothing else to configure):
 torchrun --nproc-per-node=4 train.py --data-dir data/libero_spatial --batch-size 8
@@ -28,22 +29,18 @@ python train.py --steps 100 --log-every 10
 python eval_libero.py --policy nano-vla --ckpt out/ckpt_last.pt --suite libero_spatial
 ```
 
-Every field of `TrainConfig` (top of `train.py`) is auto-exposed as a CLI flag (hyphenated). Booleans become `--foo`/`--no-foo` via `argparse.BooleanOptionalAction`. There is no separate config file.
-
-There is no test suite, linter, or build step.
+Every field of `TrainConfig` (top of `train.py`) is auto-exposed as a CLI flag (hyphenated). Booleans become `--foo`/`--no-foo` via `argparse.BooleanOptionalAction`. There is no separate config file, no test suite, no linter, and no build step.
 
 ## Architecture
 
-The pipeline is five files connected by two contracts. Understand the contracts and the rest follows.
-
-**Contract 1 — flat `.npz` data format** (produced by `convert_libero.py`, consumed by `data.py`):
+Six files, two contracts. **Contract 1 — flat `.npz` data format** (both converters produce, `data.TrajectoryDataset` consumes):
 ```
 data/<dataset>/
   episode_NNNNN.npz   # images_primary, images_wrist (uint8), actions (T,7) float32, instruction (str)
   index.json          # {ep_name: {length, instruction, file, source_*}}
   stats.json          # action_q01, action_q99, num_bins, image_size
 ```
-Files are written **uncompressed** (`np.savez`) so the dataloader can `mmap_mode='r'` and page in only one frame per `__getitem__`. Compressed npz would force whole-episode decompression per sample (~10× slower training). To support a non-LIBERO dataset, write a new conversion script that emits this exact layout — nothing in `model.py`/`data.py`/`train.py` is LIBERO-specific.
+Files are written **uncompressed** (`np.savez`) so the dataloader can `mmap_mode='r'` and page in only one frame per `__getitem__`. Compressed npz would force whole-episode decompression per sample (~10× slower training). To support a non-LIBERO dataset, write a new conversion script that emits this exact layout — nothing in `model.py`/`data.py`/`train.py` is LIBERO-specific. `data.LeRobotTrajectoryDataset` is a second backend that reads a LeRobot v2.x layout (`meta/info.json` + parquet + mp4) directly with no offline conversion; `data.make_dataset(data_dir)` picks the backend by checking for `meta/info.json`. The direct path is slower (per-episode mp4 decode with a per-worker LRU cache) — for serious training, prefer `convert_libero_lerobot.py` and the flat-npz path.
 
 **Contract 2 — policy interface** (between model and eval harness):
 ```python
@@ -58,29 +55,26 @@ policy.predict(images: dict, instruction: str) -> np.ndarray  # shape (chunk_siz
 
 2. **Loss masking via slicing, not `-100` labels.** Sequence layout is `[image_tokens, instruction_tokens, action_tokens]` and CE is computed only on the action positions. Instead of building a full-length labels tensor padded with `-100`, `forward()` slices `logits[:, -T_act-1 : -1, :]` directly. Same math, fewer lines. The off-by-one (`-T_act-1 : -1`) reflects that token at position `p` is predicted by logits at `p-1`.
 
+3. **Sequence layout.** `[N_img vision tokens] + [T_text instruction tokens (padded)] + [T_act action tokens]`, with `T_act = chunk_size * action_dim` (default `8 * 7 = 56`). The attention mask is built by `F.pad(instruction_mask, (N_img, T_act), value=1)` — image and action positions are always real, only the instruction can be padded.
+
 ### Train/eval pixel-pipeline invariant
 
-`convert_libero.resize_views` is imported by `eval_libero.obs_to_images` precisely so the vertical-flip (`f[::-1]`) and resize stay byte-for-byte identical between the trajectories the model trained on and the live sim observations it sees at eval. **Do not duplicate this code.** If you change the flip or resize on either side, you silently break the train/eval correspondence and eval success rate collapses while train accuracy looks fine — this is the most likely cause of the symptom "train action_acc is high but eval succeeds 0%".
-
-The HDF5 key names (`agentview_rgb`, `eye_in_hand_rgb`) and the live robosuite obs key names (`agentview_image`, `robot0_eye_in_hand_image`) differ by suffix but contain identical pixels, so the conversion-time pipeline is reusable as-is.
-
-### Sequence layout in `forward()`
-
-Every batch is laid out as `[N_img vision tokens] + [T_text instruction tokens (padded)] + [T_act action tokens]`. The attention mask is built by `F.pad(instruction_mask, (N_img, T_act), value=1)` — image and action positions are always real, only the instruction can be padded. `T_act = chunk_size * action_dim` (default `8 * 7 = 56`).
+`convert_libero.resize_views` is imported by `eval_libero.obs_to_images` precisely so the vertical-flip (`f[::-1]`) and resize stay byte-for-byte identical between the trajectories the model trained on and the live sim observations it sees at eval. **Do not duplicate this code.** If you change the flip or resize on either side, you silently break the train/eval correspondence and eval success rate collapses while train accuracy looks fine — this is the most likely cause of the symptom "train action_acc is high but eval succeeds 0%". HDF5 key names (`agentview_rgb`, `eye_in_hand_rgb`) and live robosuite obs keys (`agentview_image`, `robot0_eye_in_hand_image`) differ by suffix but contain identical pixels, so the pipeline is reusable as-is. `convert_libero_lerobot.py` and `LeRobotTrajectoryDataset` deliberately **skip the `f[::-1]` flip** because LeRobot LIBERO mp4s are already stored upright; for a non-LIBERO LeRobot dataset, verify orientation against the live sim before trusting eval numbers.
 
 ### Sampling and DDP
 
-`TrajectoryDataset.__getitem__` ignores its index and samples `(episode, t)` internally via length-weighted `random.choices`. There is **no `DistributedSampler`** — DDP rank disambiguation comes from `make_worker_init(seed, rank)` in `train.py`, which seeds Python's `random` and `numpy.random` per worker per rank. PyTorch's DataLoader auto-seeds `torch`'s RNG in workers but not `random`, so without this every rank would draw the same sequence.
+Both `TrajectoryDataset.__getitem__` and `LeRobotTrajectoryDataset.__getitem__` ignore their index and sample `(episode, t)` internally via length-weighted `random.choices`. There is **no `DistributedSampler`** — DDP rank disambiguation comes from `make_worker_init(seed, rank)` in `train.py`, which seeds Python's `random` and `numpy.random` per worker per rank. PyTorch's DataLoader auto-seeds `torch`'s RNG in workers but not `random`, so without this every rank would draw the same sequence.
 
 ### Other things worth knowing
 
 - Vision tower is **frozen by default** (`freeze_vision=True`); `train.py` calls `base.vision.eval()` to keep its LayerNorms in eval mode even though the rest of the model is `.train()`.
 - bf16 is on by default (`--bf16`); only the forward is autocast, the optimizer steps in fp32.
-- Inference recomputes from scratch each step (no KV cache). KV cache would be ~5× faster but add complexity; see `NEEDS_REVIEW.md` 1.3.
+- Inference recomputes from scratch each step (no KV cache); see `NEEDS_REVIEW.md` 1.3.
 - Loss/accuracy are accumulated as GPU tensors and only `.item()`d at the log boundary — adding a per-step `.item()` will reintroduce a CUDA sync every iteration.
-- `forward()` returns `(loss, action_logits)`; the second tensor exists solely for the train-time accuracy metric. This is an intentional (mild) leaky abstraction — see `NEEDS_REVIEW.md` 4.
+- `forward()` returns `(loss, action_logits)` — the second tensor is for the train-time accuracy metric (mild leaky abstraction, see `NEEDS_REVIEW.md` 4).
 
 ## Reference files
 
-- `README.md` is the canonical writeup, including the four-axes design-space chart and per-system comparison table. Items marked with † in that table are unverified; don't cite without checking the source.
-- `NEEDS_REVIEW.md` lists open decisions, things to verify on first run (LIBERO API specifics), and changes deliberately not made. Read before making structural changes — it documents *why* certain "improvements" were skipped.
+- `README.md` — canonical writeup with four-axes design-space chart and per-system comparison table (TOC at top). Items marked with † are unverified; don't cite without checking the source.
+- `NEEDS_REVIEW.md` — open decisions, things to verify on first run (LIBERO API specifics), and changes deliberately not made. Read before structural changes — it documents *why* certain "improvements" were skipped.
+- `convert_libero_lerobot.py` — LeRobot v2.x converter (parquet + mp4 → flat .npz); pair with `data.LeRobotTrajectoryDataset` to skip conversion at the cost of training speed.

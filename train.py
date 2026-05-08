@@ -1,17 +1,8 @@
-"""nanoVLA training: raw PyTorch loop, single-GPU first, optional DDP.
+"""nanoVLA training: raw PyTorch loop, single-GPU by default, DDP via torchrun.
 
-Configuration is a single @dataclass at the top of this file. Every field
-is overridable via CLI flags of the same name with hyphens, e.g.:
-
-    python train.py --data-dir data/libero_spatial --batch-size 16 --steps 50000
-    python train.py --no-bf16 --no-freeze-vision        # disable boolean flags
-    python train.py --wandb --wandb-project my-runs
-
-Single-GPU is the default. DDP is enabled simply by launching with torchrun:
-
-    torchrun --nproc-per-node=4 train.py --data-dir data/libero_spatial
-
-Everything DDP-related is guarded by `if world_size > 1`.
+Every field of TrainConfig is auto-exposed as a `--field-name` CLI flag;
+booleans become `--foo` / `--no-foo`. DDP-specific code is guarded by
+`if world_size > 1`.
 """
 import argparse
 import json
@@ -26,7 +17,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from data import Collator, TrajectoryDataset, make_dataloader
+from data import Collator, make_dataloader, make_dataset
 from model import NanoVLA, VLAConfig
 
 
@@ -94,17 +85,8 @@ def cosine_with_warmup(step: int, peak_lr: float, warmup: int, total: int) -> fl
     return peak_lr * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def trainable_params(model):
-    return [p for p in model.parameters() if p.requires_grad]
-
-
 def make_worker_init(base_seed: int, rank: int):
-    """Seed Python's `random` and numpy per-worker per-rank.
-
-    PyTorch's DataLoader auto-seeds torch's RNG in workers, but NOT Python's
-    `random` module — and not in a rank-aware way. Without this, our internal
-    `random.choices` sampling would draw the same sequence on every DDP rank.
-    """
+    """Rank-aware per-worker seed for Python `random` (DataLoader doesn't seed it)."""
     def _init(worker_id: int):
         seed = (base_seed + rank * 1_000_003 + worker_id) % (2 ** 32)
         random.seed(seed)
@@ -126,8 +108,14 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
+    # ---- data ----
+    # make_dataset auto-picks flat-npz vs. LeRobot based on data_dir contents.
+    # Building the dataset first lets us read action quantiles off it without
+    # needing stats.json (the LeRobot path computes them from parquet).
+    dataset = make_dataset(cfg.data_dir, chunk_size=cfg.chunk_size,
+                           use_wrist_camera=cfg.use_wrist_camera)
+
     # ---- model ----
-    stats = json.loads((Path(cfg.data_dir) / "stats.json").read_text())
     vla_config = VLAConfig(
         vision_model_id=cfg.vision_model_id,
         lm_model_id=cfg.lm_model_id,
@@ -136,15 +124,11 @@ def main():
         num_bins=cfg.num_bins,
         freeze_vision=cfg.freeze_vision,
     )
-    model = NanoVLA(vla_config, action_q01=stats["action_q01"],
-                    action_q99=stats["action_q99"]).to(device)
+    model = NanoVLA(vla_config, action_q01=dataset.action_q01,
+                    action_q99=dataset.action_q99).to(device)
     if world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     base = model.module if world_size > 1 else model
-
-    # ---- data ----
-    dataset = TrajectoryDataset(cfg.data_dir, chunk_size=cfg.chunk_size,
-                                use_wrist_camera=cfg.use_wrist_camera)
     collator = Collator(
         tokenizer=base.tokenizer,
         action_tokenizer=base.action_tokenizer,
@@ -159,7 +143,7 @@ def main():
                              worker_init_fn=make_worker_init(cfg.seed, rank))
 
     # ---- optimizer ----
-    params = trainable_params(model)
+    params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay,
                             betas=(0.9, 0.95))
 

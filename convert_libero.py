@@ -28,12 +28,7 @@ from tqdm import tqdm
 
 
 def parse_instruction(filename: str) -> str:
-    """LIBERO HDF5 filenames encode the task; convert to a natural-language instruction.
-
-    Handles both:
-      - libero_spatial_no_noops style: 'pick_up_the_black_bowl_..._demo.hdf5'
-      - older KITCHEN_SCENE3_turn_on_the_stove_demo.hdf5 style (drops the SCENE prefix)
-    """
+    """LIBERO HDF5 filename -> natural-language instruction (strips SCENE prefixes)."""
     name = filename.replace("_demo.hdf5", "").replace(".hdf5", "")
     name = re.sub(r"_SCENE\d+", "", name)
     name = re.sub(r"^[A-Z][A-Z_]+_", "", name)
