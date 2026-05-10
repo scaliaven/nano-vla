@@ -3,12 +3,15 @@
 The conceptual heart, in ~30 lines of forward():
   1. Vision tower turns each image into N patch tokens.
   2. Projector maps vision tokens into the LM's hidden size (LLaVA-style).
-  3. LM input = [image_tokens, instruction_tokens, action_tokens] (teacher-forced).
-  4. LM forward gives logits at every position.
+  3. LM input = [image_tokens, instruction_tokens, action_query × T_act]
+     — action positions are filled with a single learned QUERY embedding,
+     not the ground-truth action tokens. The LM "fills them in."
+  4. LM forward gives logits at every position; all action tokens are
+     predicted in ONE pass (parallel decoding, OFT-style).
   5. Cross-entropy is computed ONLY at action positions (image+instruction
      positions are masked out of the loss).
 
-Two non-obvious moves, both there to keep the line count low:
+Three non-obvious moves, all there to keep the line count low:
 
   (a) The vocab-tail trick. We discretize each action dim into 256 bins and map
       bin index b -> LM token id (V - 256 + b), where V is the LM tokenizer
@@ -23,6 +26,12 @@ Two non-obvious moves, both there to keep the line count low:
       logits out of the full logits tensor and run cross-entropy directly,
       instead of building a full-length labels tensor padded with -100 at the
       image/text positions. Same math, ~5 fewer lines, easier to read.
+
+  (c) Parallel action decoding (OFT-style; nanoVLA departs from base OpenVLA
+      here). One learned query embedding fills every action slot; RoPE makes
+      same-input slots predict different bins. One forward per chunk, no
+      teacher forcing. See README#parallel-action-decoding for the full
+      rationale.
 """
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -162,6 +171,10 @@ class NanoVLA(nn.Module):
             q01=action_q01, q99=action_q99,
             num_bins=config.num_bins, vocab_size=self.vocab_size,
         )
+        self.action_query = nn.Parameter(
+            torch.zeros(1, 1, self.lm.config.hidden_size)
+        )
+        nn.init.normal_(self.action_query, std=0.02)
 
     @property
     def chunk_size(self):
@@ -195,31 +208,27 @@ class NanoVLA(nn.Module):
             wrist             same                     — only if use_wrist_camera
             instruction_ids   (B, T_text) long         — LM-tokenized instruction (padded)
             instruction_mask  (B, T_text) long/bool    — 1 for real tokens, 0 for pad
-            action_token_ids  (B, T_act)  long         — LM-vocab IDs (vocab tail)
+            action_token_ids  (B, T_act)  long         — LM-vocab IDs (vocab tail),
+                                                         used as TARGETS only.
                                                          T_act = chunk_size * action_dim
-
-        Sequence laid out as [image_tokens, instruction_tokens, action_tokens],
-        teacher-forced; CE is computed only on action positions.
         """
         wrist = batch.get("wrist") if self.config.use_wrist_camera else None
         img = self._encode_images(batch["primary"], wrist)             # (B, N_img, D)
         txt = self._embed_tokens(batch["instruction_ids"])             # (B, T_text, D)
-        act = self._embed_tokens(batch["action_token_ids"])            # (B, T_act, D)
+        B, T_act = img.shape[0], self.action_seq_len
+        act = self.action_query.expand(B, T_act, -1).to(txt.dtype)     # (B, T_act, D)
 
         inputs_embeds = torch.cat([img, txt, act], dim=1)              # (B, L, D)
         # Image and action positions are always real; only instruction tokens
         # may be padded. F.pad on the (B, T_text) mask adds N_img leading 1s
         # and T_act trailing 1s.
-        N_img, T_act = img.shape[1], act.shape[1]
+        N_img = img.shape[1]
         attn_mask = F.pad(batch["instruction_mask"].long(), (N_img, T_act), value=1)
 
         out = self.lm(inputs_embeds=inputs_embeds, attention_mask=attn_mask, use_cache=False)
         logits = out.logits                                            # (B, L, V)
 
-        # Each action token at sequence position p is predicted by logits at p-1.
-        # Action tokens occupy the LAST T_act positions, so their predictions
-        # come from logits[L-T_act-1 : L-1]. (Slicing avoids -100 label plumbing.)
-        action_logits = logits[:, -T_act - 1 : -1, :]                  # (B, T_act, V)
+        action_logits = logits[:, -T_act:, :]                          # (B, T_act, V)
         loss = F.cross_entropy(
             action_logits.reshape(-1, self.vocab_size),
             batch["action_token_ids"].reshape(-1),
@@ -230,7 +239,7 @@ class NanoVLA(nn.Module):
 
     @torch.no_grad()
     def predict(self, images: dict, instruction: str) -> np.ndarray:
-        """Greedy autoregressive sampling over the vocab tail.
+        """One-shot parallel decoding over the vocab tail.
 
         Constraining argmax to the last `num_bins` logits is what makes the
         vocab-tail trick safe at inference: even if the LM gives some text
@@ -249,21 +258,23 @@ class NanoVLA(nn.Module):
         )
         instruction_ids = tok.input_ids.to(device)
 
-        seq = torch.cat([
-            self._encode_images(primary, wrist),
-            self._embed_tokens(instruction_ids),
-        ], dim=1)
-
+        # Match training: forward in bf16 autocast so vision (fp32) and LM
+        # (often loaded as bf16 from HF config) agree on dtype.
+        amp = torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                 enabled=device.type == "cuda")
         offset = self.vocab_size - self.config.num_bins
-        token_ids = []
-        for _ in range(self.action_seq_len):
-            logits = self.lm(inputs_embeds=seq, use_cache=False).logits[:, -1, :]
-            bin_idx = logits[:, offset:].argmax(dim=-1)                # (1,)
-            tok_id = bin_idx + offset
-            token_ids.append(tok_id)
-            seq = torch.cat([seq, self._embed_tokens(tok_id.unsqueeze(-1))], dim=1)
+        T_act = self.action_seq_len
+        with amp:
+            txt = self._embed_tokens(instruction_ids)
+            seq = torch.cat([
+                self._encode_images(primary, wrist),
+                txt,
+                self.action_query.expand(1, T_act, -1).to(txt.dtype),
+            ], dim=1)
+            logits = self.lm(inputs_embeds=seq, use_cache=False).logits[:, -T_act:, :]
+            bin_idx = logits[..., offset:].argmax(dim=-1)              # (1, T_act)
 
-        token_ids = torch.cat(token_ids, dim=0).cpu()                  # (T_act,)
+        token_ids = (bin_idx + offset).view(T_act).cpu()
         grid = token_ids.view(self.config.chunk_size, self.config.action_dim)
         return self.action_tokenizer.decode(grid).astype(np.float32)
 

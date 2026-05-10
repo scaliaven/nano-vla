@@ -11,11 +11,10 @@ These are fine if you agree, but they're not your choices yet.
 | # | Where | Decision | Alternative |
 |---|---|---|---|
 | 1.1 | `model.py` `VLAConfig.prompt_template` | Used OpenVLA's `"In: What action should the robot take to {instruction}? Out:"` | Could use a chat template, a bare instruction, or a custom format. One-line change. |
-| 1.2 | `convert_libero.py:resize_views` | **Vertical flip only** (`f[::-1]`), matching LIBERO's official eval convention. | OpenVLA-OFT uses `[::-1, ::-1]` (180° rotation). If your reference is OpenVLA-OFT, change one line in both `convert_libero.py` and `eval_libero.obs_to_images`. |
-| 1.3 | `model.py:NanoVLA.predict` | **Recomputation, no KV cache.** ~30 ms per chunk on GPU. | KV cache via `past_key_values` would cut that ~5×. Not worth the complexity for chunked eval; reconsider for low-latency real-robot deploy. |
-| 1.4 | `train.py:TrainConfig` defaults | bf16 + AdamW + cosine-with-warmup + β=(0.9, 0.95) + lr=2e-5 + warmup 500 + clip 1.0. | OpenVLA-ish defaults; no source of truth. Adjust per your training rig. |
-| 1.5 | `convert_libero.py` | **`np.savez` (uncompressed)**, not `np.savez_compressed`. ~22 GB on disk for LIBERO-Spatial vs ~3 GB compressed. | Required so the dataloader can `mmap_mode='r'` and avoid decompressing whole episodes per sample. If disk is the constraint, keep compressed and accept ~10× slower data loading. |
-| 1.6 | `README.md` License section | **TBD.** | Pick one before publishing. |
+| 1.2 | `convert_libero.py:resize_views` | **Resolved: 180° rotation** (`f[::-1, ::-1]`). LeRobot LIBERO mp4s were published rotated 180° from raw robosuite, so HDF5 conv + live eval must match. Verified against the GR00T LIBERO eval reference (`libero_scripts/utils.py:get_libero_image`). Old HDF5-converted .npz data needs to be regenerated. | — |
+| 1.3 | `train.py:TrainConfig` defaults | bf16 + AdamW + cosine-with-warmup + β=(0.9, 0.95) + lr=2e-5 + warmup 500 + clip 1.0. | OpenVLA-ish defaults; no source of truth. Adjust per your training rig. |
+| 1.4 | `convert_libero.py` | **`np.savez` (uncompressed)**, not `np.savez_compressed`. ~22 GB on disk for LIBERO-Spatial vs ~3 GB compressed. | Required so the dataloader can `mmap_mode='r'` and avoid decompressing whole episodes per sample. If disk is the constraint, keep compressed and accept ~10× slower data loading. |
+| 1.5 | `README.md` License section | **TBD.** | Pick one before publishing. |
 
 ## 2. Things to verify on first run (LIBERO API specifics)
 
@@ -77,7 +76,7 @@ Nothing has been run yet. Before serious training time:
 
 - [ ] `python convert_libero.py --src ... --out ... --max-demos-per-task 1` against actual LIBERO files (validates HDF5 keys + instruction parsing).
 - [ ] `python eval_libero.py --policy random --num-trials 1` against actual LIBERO sim (validates `make_env`, `obs_to_images` keys, `rollout` loop).
-- [ ] `python train.py --steps 100 --log-every 10` for a smoke run (validates the full forward/backward loop, action accuracy starts climbing).
+- [ ] `python train.py --steps 100 --log-every 10` for a smoke run (validates the full forward/backward loop, action accuracy starts climbing). **Note:** post parallel-decoding, old checkpoints won't load (new `action_query` param + different objective) — train fresh.
 - [ ] DDP path is guarded but **untested**: `torchrun --nproc-per-node=2 train.py --steps 100`.
 
 ## 6. Future / v2
@@ -89,6 +88,5 @@ Documented in `README.md#v2-roadmap`:
 - Proprioception input
 - Residual VQ action tokens
 - Flow-matching action head (π0-style)
-- KV cache in `predict` for low-latency real-robot deploy (~5× faster inference)
 
 Each is a single-axis swap that should fit in a small PR.
