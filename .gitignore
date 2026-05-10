@@ -17,3 +17,15 @@ eval_results.json
 .vscode/
 .idea/
 .DS_Store
+
+# Shell scripts
+*.sh
+
+# trainging logs
+logs/
+jobs/
+
+# result json
+eval_results_*.json
+
+out_lr1e4/*

@@ -11,11 +11,11 @@ Layout this script writes (Contract 1 from CLAUDE.md):
     <out>/index.json
     <out>/stats.json
 
-Why a separate script (vs. convert_libero.py): LeRobot LIBERO mp4s are *already*
-vertically un-flipped — applying the [::-1] flip from convert_libero.resize_views
-here would put the robot upside-down. We resize-only, and the resulting pixels are
-byte-equivalent to what the HDF5 path produces, so eval_libero.obs_to_images
-(which still flips live robosuite obs) keeps working unchanged.
+Why a separate script (vs. convert_libero.py): LeRobot LIBERO mp4s are already
+oriented as `raw[::-1, ::-1]` (180° rotation) — that's why convert_libero.resize_views
+applies the same 180° rotation to HDF5 raw and to live eval obs. Re-applying it here
+would rotate the frames a second time. So we resize-only, and the resulting pixels
+are byte-equivalent to what the HDF5 path produces.
 
 Requires `imageio` (with pyav backend) and `pyarrow`. The lerobot conda env has both.
 

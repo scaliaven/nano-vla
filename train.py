@@ -23,7 +23,7 @@ from model import NanoVLA, VLAConfig
 
 @dataclass
 class TrainConfig:
-    # data
+    # data — comma-separated for multi-dataset mixing, e.g. "data/spatial,data/object"
     data_dir: str = "data/libero_spatial"
     use_wrist_camera: bool = False
     # model
@@ -94,6 +94,11 @@ def make_worker_init(base_seed: int, rank: int):
     return _init
 
 
+def cycle(loader):
+    while True:
+        yield from loader
+
+
 def main():
     cfg = parse_cli()
     rank, world_size, local_rank = setup_ddp()
@@ -109,9 +114,8 @@ def main():
         (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
 
     # ---- data ----
-    # make_dataset auto-picks flat-npz vs. LeRobot based on data_dir contents.
-    # Building the dataset first lets us read action quantiles off it without
-    # needing stats.json (the LeRobot path computes them from parquet).
+    # Build dataset first so action_q01/q99 are available for the model
+    # (LeRobot backend computes them in __init__; no stats.json there).
     dataset = make_dataset(cfg.data_dir, chunk_size=cfg.chunk_size,
                            use_wrist_camera=cfg.use_wrist_camera)
 
@@ -164,13 +168,12 @@ def main():
     acc_sum = torch.zeros((), device=device)
     n_log = 0
     t0 = time.time()
-    data_iter = iter(loader)
+    # action labels live in the vocab tail [V-num_bins, V); restricting argmax
+    # there matches NanoVLA.predict and is ~600× cheaper than full-vocab argmax.
+    action_offset = base.vocab_size - cfg.num_bins
+    data_iter = cycle(loader)
     while step < cfg.steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            batch = next(data_iter)
+        batch = next(data_iter)
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
         with torch.amp.autocast("cuda", dtype=dtype,
@@ -190,7 +193,7 @@ def main():
         step += 1
 
         with torch.no_grad():
-            preds = action_logits.argmax(dim=-1)
+            preds = action_logits[..., action_offset:].argmax(dim=-1) + action_offset
             acc_sum += (preds == batch["action_token_ids"]).float().mean()
         loss_sum += loss.detach()
         n_log += 1

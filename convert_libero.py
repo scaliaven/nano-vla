@@ -38,13 +38,17 @@ def parse_instruction(filename: str) -> str:
 def resize_views(frames: np.ndarray, size: int) -> np.ndarray:
     """(T,H,W,3) uint8 LIBERO render -> (T,size,size,3) uint8.
 
-    LIBERO/robosuite renders are flipped vertically (OpenGL origin); we un-flip here so
-    saved frames look right-side-up to a human.  eval_libero.py MUST apply the same
-    flip when reading sim observations, otherwise train/eval pixels disagree.
+    Applies a 180° rotation (`f[::-1, ::-1]`): the vertical un-flip undoes the
+    OpenGL origin of LIBERO/robosuite renders, and the horizontal mirror aligns
+    with the LeRobot LIBERO mp4 publishing convention (frames stored as
+    `raw[::-1, ::-1]`). Without the horizontal piece, HDF5-converted training
+    data and live eval obs end up mirrored relative to LeRobot training mp4s,
+    so a LeRobot-trained policy reaches in the wrong direction at eval.
+    eval_libero.py MUST keep using this helper so train/eval pixels agree.
     """
     out = np.empty((len(frames), size, size, 3), dtype=np.uint8)
     for i, f in enumerate(frames):
-        img = Image.fromarray(f[::-1])
+        img = Image.fromarray(f[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), Image.BILINEAR)
         out[i] = np.asarray(img)
