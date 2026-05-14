@@ -159,10 +159,10 @@ def main():
         assert args.ckpt is not None, "--ckpt required for --policy nano-vla"
         policy = load_nano_vla(args.ckpt)
         # LeRobot LIBERO stores gripper in [0,1]; HDF5-converted data uses [-1,1].
-        # Detect from the saved quantiles so the same eval works for either.
+        # Detect by sign: any clearly-negative q01 means the [-1,+1] convention.
+        # Tolerant of small noise in q01 (e.g. 0.01) on the LeRobot side.
         q01 = policy.action_tokenizer.q01
-        q99 = policy.action_tokenizer.q99
-        gripper_rescale = bool(abs(q01[-1]) < 1e-3 and abs(q99[-1] - 1.0) < 1e-3)
+        gripper_rescale = bool(q01[-1] > -0.1)
         if gripper_rescale:
             print("[eval] gripper rescale ON: model output [0,1] -> sim {-1,+1} (binarized)")
 

@@ -67,8 +67,18 @@ After the initial draft, three review agents flagged 25 issues. **12 were fixed*
 
 - **`forward()` returning `(loss, action_logits)`** for the train accuracy metric. Computing accuracy inside `forward()` would couple training-only diagnostics to the model code. Mild leaky abstraction, intentional.
 - **Manual mean/std → `x*2-1`** in `preprocess_image`. SigLIP uses 0.5/0.5/0.5 so the math collapses, but the explicit constants pedagogically signal "this is SigLIP normalization". Clarity wins.
-- **Prompt-format-and-tokenize duplicated between `predict` and `Collator`**. 3 lines of overlap; the contexts differ slightly (single string vs list); extracting a helper buys < 5 lines and adds an indirection.
+- ~~**Prompt-format-and-tokenize duplicated between `predict` and `Collator`**~~ → **Reversed**. The duplication was load-bearing in the wrong direction: `Collator` left-padded with `padding="longest"`, `predict` used no padding at all, and the action_query RoPE positions silently diverged between train and eval. On libero_spatial this dropped TF bin-acc from ~100% to ~30% and was the root cause of the suite's eval collapse. Both paths now left-pad to `max_instruction_tokens` (fixed length). The duplication remains but the schemes are now identical; a future cleanup could extract a helper.
 - **Render at 224 directly in eval to skip the resize**. Would diverge from the 128 → 224 pixel pipeline used at training time. Train/eval consistency wins.
+
+## 7. Architecture changes (2026-05): parallel decoding tightening
+
+After diagnosing the libero_spatial eval-collapse via `sanity_replay.py`, three coupled changes landed:
+
+- **Per-position action query embeddings.** `self.action_query` is now `(1, T_act, hidden_size)` (was `(1, 1, hidden_size)` broadcast). Each action slot has its own learned identity in addition to RoPE differentiation. OpenVLA-OFT uses empty/zero embeddings + RoPE only; we add learnables for slightly richer slot identity at ~50K extra params.
+- **Bidirectional attention in the action region.** A 4D additive attention mask (`_build_attention_mask`) keeps [image | prompt] causal but makes the action block fully bidirectional. Required for action chunking to be a real joint prediction rather than 56 quasi-AR sibling predictions sharing a backbone.
+- **Fixed-length left-padding** in both `data.py:Collator` and `model.py:predict`. Pads to `max_instruction_tokens` (default 64). Action_query RoPE positions are now identical across batches and at eval.
+
+**Old checkpoints will NOT load** — `action_query` shape changed from `(1, 1, H)` to `(1, T_act, H)`. Retrain after pulling these changes. Existing ckpts under the old shape can still be loaded via a small `model.from_checkpoint` shim that broadcasts the old `(1, 1, H)` parameter to `(1, T_act, H)` if backwards-compat with prior runs is needed.
 
 ## 5. Untested paths
 
