@@ -28,4 +28,6 @@ jobs/
 # result json
 eval_results_*.json
 
+checkpoint/
 out_lr1e4/*
+eval_results/*

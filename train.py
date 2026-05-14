@@ -5,6 +5,7 @@ booleans become `--foo` / `--no-foo`. DDP-specific code is guarded by
 `if world_size > 1`.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -176,10 +177,23 @@ def main():
         batch = next(data_iter)
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-        with torch.amp.autocast("cuda", dtype=dtype,
-                                enabled=cfg.bf16 and torch.cuda.is_available()):
+        # Under DDP, skip the gradient all-reduce on every micro-batch except
+        # the last one — only the optimizer-step boundary needs synced grads.
+        last_micro = (accum + 1) == cfg.grad_accum
+        sync_ctx = (model.no_sync() if world_size > 1 and not last_micro
+                    else contextlib.nullcontext())
+        with sync_ctx, torch.amp.autocast("cuda", dtype=dtype,
+                                          enabled=cfg.bf16 and torch.cuda.is_available()):
             loss, action_logits = model(batch)
         (loss / cfg.grad_accum).backward()
+
+        # Accumulate metrics on EVERY micro-batch, not only the last one.
+        with torch.no_grad():
+            preds = action_logits[..., action_offset:].argmax(dim=-1) + action_offset
+            acc_sum += (preds == batch["action_token_ids"]).float().mean()
+        loss_sum += loss.detach()
+        n_log += 1
+
         accum += 1
         if accum < cfg.grad_accum:
             continue
@@ -192,12 +206,6 @@ def main():
         accum = 0
         step += 1
 
-        with torch.no_grad():
-            preds = action_logits[..., action_offset:].argmax(dim=-1) + action_offset
-            acc_sum += (preds == batch["action_token_ids"]).float().mean()
-        loss_sum += loss.detach()
-        n_log += 1
-
         if step % cfg.log_every == 0 and is_main:
             dt = time.time() - t0
             lr_now = opt.param_groups[0]["lr"]
@@ -205,7 +213,7 @@ def main():
             mean_acc = (acc_sum / n_log).item()
             print(f"step {step:>6d} | loss {mean_loss:.4f} "
                   f"| act_acc {mean_acc:.3f} | lr {lr_now:.2e} "
-                  f"| step/s {n_log/dt:.2f}")
+                  f"| step/s {cfg.log_every/dt:.2f}")
             if cfg.wandb:
                 wandb.log({"loss": mean_loss, "act_acc": mean_acc,
                            "lr": lr_now, "step": step})

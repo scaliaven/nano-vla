@@ -24,6 +24,7 @@ dict (primary, [wrist], instruction, actions).
 import itertools
 import json
 import random
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -32,10 +33,13 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 
 
-# Module-level cache: each DataLoader worker fork-inherits an empty copy and
-# fills it with the mp4 paths it actually touches. Containers are small and
-# there are O(num_episodes) of them, so no LRU eviction is needed at LIBERO scale.
-_VIDEO_DECODERS: dict = {}  # path -> (av.container, video_stream)
+# Per-worker LRU of open PyAV decoders. Each open container holds an FD plus
+# a libsvtav1 decoder context (a few MB + a thread pool); unbounded growth
+# starved libero_90 (~3.9k episodes × 2 cameras) and produced EAGAIN out of
+# swscale.reformat once the allocator ran out. 128 keeps the working set hot
+# for typical batch_size × num_workers draws.
+_DECODER_CACHE_SIZE = 128
+_VIDEO_DECODERS: "OrderedDict[str, tuple]" = OrderedDict()
 
 
 def _decoder_for(path: Path):
@@ -46,6 +50,11 @@ def _decoder_for(path: Path):
         container = av.open(key)
         cached = (container, container.streams.video[0])
         _VIDEO_DECODERS[key] = cached
+        if len(_VIDEO_DECODERS) > _DECODER_CACHE_SIZE:
+            _, (old, _) = _VIDEO_DECODERS.popitem(last=False)
+            old.close()
+    else:
+        _VIDEO_DECODERS.move_to_end(key)
     return cached
 
 
@@ -82,7 +91,9 @@ class TrajectoryDataset(Dataset):
         # uniformly spread over transitions, weighted by episode length.
         ep_name = random.choices(self.episodes, weights=self.lengths, k=1)[0]
         T = self.index[ep_name]["length"]
-        t = random.randrange(T)
+        # Restrict to t where the full chunk fits — avoids training on
+        # post-completion frames paired with "last action × chunk_size" pads.
+        t = random.randrange(max(1, T - self.chunk_size + 1))
         path = self.data_dir / self.index[ep_name]["file"]
         # mmap_mode='r' means only the bytes for one frame + the action chunk
         # are paged in — critical because each .npz is ~20MB uncompressed.
@@ -109,13 +120,18 @@ class Collator:
     Produces the dict that NanoVLA.forward() consumes:
         primary           (B, H, W, 3) uint8       — kept uint8; model normalizes on GPU
         wrist             same                     — only if use_wrist_camera
-        instruction_ids   (B, T_text) long         — padded to longest in batch
+        instruction_ids   (B, T_text) long         — left-padded to max_instruction_tokens
         instruction_mask  (B, T_text) long
         action_token_ids  (B, K * action_dim) long — vocab-tail LM token ids
     """
 
     def __init__(self, tokenizer, action_tokenizer, prompt_template: str,
                  max_instruction_tokens: int, use_wrist_camera: bool = False):
+        # Left-pad to a FIXED max_instruction_tokens so (a) action_query RoPE
+        # positions are train/eval-invariant (no batch-dependent shift) and
+        # (b) the last real instruction token stays adjacent to action_query[0].
+        # padding_side="left" is set globally on the shared tokenizer in
+        # NanoVLA.__init__.
         self.tokenizer = tokenizer
         self.action_tokenizer = action_tokenizer
         self.prompt_template = prompt_template
@@ -126,7 +142,7 @@ class Collator:
         prompts = [self.prompt_template.format(instruction=s["instruction"].strip())
                    for s in samples]
         tok = self.tokenizer(
-            prompts, padding="longest", truncation=True,
+            prompts, padding="max_length", truncation=True,
             max_length=self.max_instruction_tokens, return_tensors="pt",
         )
         actions = np.stack([s["actions"] for s in samples], axis=0)        # (B, K, A)
@@ -239,7 +255,8 @@ class LeRobotTrajectoryDataset(Dataset):
         # Ignore idx — sample (episode, t) ourselves, length-weighted.
         em = random.choices(self.episode_meta, weights=self.lengths, k=1)[0]
         ep_idx, T, instr = em["ep_idx"], em["length"], em["instruction"]
-        t = random.randrange(T)
+        # See TrajectoryDataset: keep chunks fully in-episode.
+        t = random.randrange(max(1, T - self.chunk_size + 1))
 
         actions = self._actions[ep_idx][t : t + self.chunk_size].copy()
         _, prim_path, wrist_path = self._ep_paths(ep_idx)

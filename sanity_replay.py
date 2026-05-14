@@ -1,25 +1,31 @@
 """Diagnostic: replay training samples through the policy.
 
-Disambiguates three failure modes when LIBERO eval reports near-zero
-success but training metrics looked fine, by comparing two decode modes
-on the same samples:
+When LIBERO eval reports near-zero success but training metrics looked
+fine, the failure is in one of three places. This script localizes it by
+running the SAME training samples through both code paths and comparing:
 
-  * teacher-forced (TF):  model sees GROUND-TRUTH past action tokens at
-                          every position. Same as `act_acc` in train.py.
-  * autoregressive (AR):  model sees its OWN argmax outputs as the prefix.
-                          Same as `policy.predict()` used in eval_libero.py.
+  * TRAIN path: model.forward() — what train.py's `act_acc` measures.
+  * EVAL  path: model.predict() — what eval_libero.py actually runs.
 
-Reading the table:
-  * AR good, TF good        -> model is fine. Failure is in the eval rollout
-                               contract (image preprocessing, gripper rescale,
-                               open-loop chunking). Try --exec-chunk-len 1.
-  * AR bad,  TF good        -> exposure bias / compounding error. Model fits
-                               under teacher forcing but its own outputs walk
-                               off-distribution. This is the case CLAUDE.md
-                               flags as "train acc high, eval 0%".
-  * AR bad,  TF bad         -> model is genuinely undertrained (or wrong ckpt
-                               loaded, or train/eval preprocessing diverged).
-                               Don't blame the eval.
+nanoVLA decodes an action chunk in ONE parallel forward — there is no
+autoregressive action loop and no teacher forcing (forward() fills action
+positions with learned query embeddings, never ground-truth tokens). So the
+two paths SHOULD agree token-for-token on the same input; the diagnostic
+value is in the cases where they don't, and in the absolute accuracy level:
+
+  * TRAIN good, EVAL good  -> model is fine. The eval failure is in the
+                             rollout CONTRACT, not the model: sim->image
+                             preprocessing, gripper rescale, or open-loop
+                             chunk length. Try --exec-chunk-len 1 in
+                             eval_libero.py, then --save-video.
+  * TRAIN good, EVAL bad   -> the eval code path diverged from the train
+                             code path: predict() does something forward()
+                             doesn't — tokenization, padding, attention
+                             mask, or image preprocessing. Diff the two.
+  * TRAIN bad,  EVAL bad   -> the model is genuinely undertrained (or the
+                             wrong ckpt was loaded, or the data the model
+                             trained on was preprocessed wrong). Don't
+                             blame the eval.
 
 Reuses the same `make_dataset` the trainer uses, so flat-npz, LeRobot-direct,
 and MultiDataset paths all work the same.
@@ -44,11 +50,16 @@ def _autocast(device):
 
 
 @torch.no_grad()
-def teacher_forced_predict(policy, sample, device):
-    """One forward() pass with GT action tokens as the prefix at every position.
+def train_path_predict(policy, sample, device):
+    """Run the training forward() on one sample and argmax its action logits.
+
+    This is the TRAIN code path — identical to what train.py does to compute
+    `act_acc`. It is NOT teacher forcing: nanoVLA's forward() fills action
+    positions with learned query embeddings, never ground-truth tokens. The
+    action_token_ids are passed only because forward() computes a CE loss
+    against them (which we discard); the prediction is argmax(action_logits).
 
     Returns (pred_tokens (T_act,), pred_actions (chunk_size, action_dim)).
-    Mirrors what train.py's `act_acc` measures.
     """
     primary = torch.from_numpy(sample["primary"][None]).to(device)
     actions_np = sample["actions"][None]                                   # (1, K, A)
@@ -56,17 +67,20 @@ def teacher_forced_predict(policy, sample, device):
         policy.action_tokenizer.encode(actions_np).reshape(1, -1)
     ).to(device)
 
+    # Match the training Collator: left-pad to max_instruction_tokens. The
+    # tokenizer is already padding_side="left" from NanoVLA.__init__.
     prompt = policy.config.prompt_template.format(
         instruction=sample["instruction"].strip())
     tok = policy.tokenizer(
         prompt, return_tensors="pt", truncation=True,
+        padding="max_length",
         max_length=policy.config.max_instruction_tokens,
     )
     batch = {
         "primary": primary,
         "instruction_ids": tok.input_ids.to(device),
         "instruction_mask": tok.attention_mask.to(device),
-        "action_token_ids": action_token_ids,
+        "action_token_ids": action_token_ids,   # forward() needs it for the loss
     }
     if policy.config.use_wrist_camera:
         batch["wrist"] = torch.from_numpy(sample["wrist"][None]).to(device)
@@ -83,7 +97,7 @@ def teacher_forced_predict(policy, sample, device):
 
 
 class Stats:
-    """Per-decode-mode accumulator."""
+    """Per-code-path accumulator."""
 
     def __init__(self, action_dim: int):
         self.chunk_l1 = np.zeros(action_dim, dtype=np.float64)
@@ -110,8 +124,9 @@ class Stats:
         }
 
 
-def _fmt_row(label, ar_v, tf_v, fmt="{:.3f}"):
-    return f"  {label:<22} | AR {fmt.format(ar_v):<8} | TF {fmt.format(tf_v):<8}"
+def _fmt_row(label, train_v, eval_v, fmt="{:.3f}"):
+    return (f"  {label:<22} | TRAIN {fmt.format(train_v):<8} "
+            f"| EVAL {fmt.format(eval_v):<8}")
 
 
 def main():
@@ -120,6 +135,12 @@ def main():
     ap.add_argument("--data-dir", type=str, required=True)
     ap.add_argument("--num-samples", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--instruction-mode", choices=["real", "empty", "scramble"],
+                    default="real",
+                    help="real: ground-truth instruction. empty: ''. scramble: "
+                         "swap each sample's instruction for a random DIFFERENT "
+                         "one from the dataset. Gap between modes = how much "
+                         "language signal the policy actually uses.")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -136,86 +157,101 @@ def main():
                       use_wrist_camera=policy.config.use_wrist_camera)
 
     A = policy.config.action_dim
-    ar = Stats(A)
-    tf = Stats(A)
+    train_stats = Stats(A)
+    eval_stats = Stats(A)
+
+    # For --instruction-mode scramble we need the set of unique instructions in
+    # the dataset to draw a *different* one for each sample. MultiDataset hides
+    # this behind .datasets; otherwise read episode_meta directly.
+    constituents = getattr(ds, "datasets", [ds])
+    instr_pool = sorted({em["instruction"] for d in constituents
+                                            for em in d.episode_meta})
 
     for i in range(args.num_samples):
         s = ds[0]  # idx ignored — both dataset classes sample (episode, t) internally
+        if args.instruction_mode == "empty":
+            s["instruction"] = ""
+        elif args.instruction_mode == "scramble":
+            choices = [x for x in instr_pool if x != s["instruction"]] or instr_pool
+            s["instruction"] = random.choice(choices)
         images = {"primary": s["primary"]}
         if policy.config.use_wrist_camera:
             images["wrist"] = s["wrist"]
         gt = s["actions"]                                                  # (K, A)
         gt_tokens = policy.action_tokenizer.encode(gt[None])[0].reshape(-1)
 
-        # Autoregressive decode (matches eval_libero.py).
-        ar_actions = policy.predict(images, s["instruction"])              # (K, A)
-        ar_tokens = policy.action_tokenizer.encode(ar_actions[None])[0].reshape(-1)
-        ar.update(gt, ar_actions, gt_tokens, ar_tokens)
+        # EVAL code path: policy.predict(), exactly what eval_libero.py runs.
+        eval_actions = policy.predict(images, s["instruction"])            # (K, A)
+        eval_tokens = policy.action_tokenizer.encode(eval_actions[None])[0].reshape(-1)
+        eval_stats.update(gt, eval_actions, gt_tokens, eval_tokens)
 
-        # Teacher-forced decode (matches train.py act_acc).
-        tf_tokens, tf_actions = teacher_forced_predict(policy, s, device)
-        tf.update(gt, tf_actions, gt_tokens, tf_tokens)
+        # TRAIN code path: model.forward(), what train.py act_acc measures.
+        train_tokens, train_actions = train_path_predict(policy, s, device)
+        train_stats.update(gt, train_actions, gt_tokens, train_tokens)
 
         if i < 3:
             print(f"\n[sample {i}] {s['instruction']!r}")
-            print(f"  gt[0]      : {np.array2string(gt[0], precision=3)}")
-            print(f"  AR pred[0] : {np.array2string(ar_actions[0], precision=3)}")
-            print(f"  TF pred[0] : {np.array2string(tf_actions[0], precision=3)}")
+            print(f"  gt[0]         : {np.array2string(gt[0], precision=3)}")
+            print(f"  TRAIN pred[0] : {np.array2string(train_actions[0], precision=3)}")
+            print(f"  EVAL  pred[0] : {np.array2string(eval_actions[0], precision=3)}")
 
     n = args.num_samples
     q01 = np.asarray(policy.action_tokenizer.q01)
     q99 = np.asarray(policy.action_tokenizer.q99)
     rng = np.maximum(q99 - q01, 1e-6)
-    ar_s = ar.summary(n, rng)
-    tf_s = tf.summary(n, rng)
+    train_s = train_stats.summary(n, rng)
+    eval_s = eval_stats.summary(n, rng)
 
     print(f"\n{'='*72}")
-    print(f"replay over {n} training samples (chunk_size={policy.config.chunk_size})")
-    print(f"AR = autoregressive (eval-style)   TF = teacher-forced (train-style)")
+    print(f"replay over {n} training samples (chunk_size={policy.config.chunk_size}, "
+          f"instruction-mode={args.instruction_mode})")
+    print(f"TRAIN = model.forward() (train-style)   EVAL = model.predict() (eval-style)")
+    print(f"both are parallel single-forward decodes — they SHOULD match")
     print(f"{'='*72}")
     print(f"q01: {np.array2string(q01, precision=3)}")
     print(f"q99: {np.array2string(q99, precision=3)}")
     print()
     print(_fmt_row("first-step L1 / range",
-                   ar_s["rel"].mean(), tf_s["rel"].mean()))
+                   train_s["rel"].mean(), eval_s["rel"].mean()))
     print(_fmt_row("bin exact-match acc",
-                   ar_s["bin_acc"], tf_s["bin_acc"], fmt="{:.1%}"))
+                   train_s["bin_acc"], eval_s["bin_acc"], fmt="{:.1%}"))
     print(_fmt_row("bin off-by-<=1 acc",
-                   ar_s["bin_off1_acc"], tf_s["bin_off1_acc"], fmt="{:.1%}"))
+                   train_s["bin_off1_acc"], eval_s["bin_off1_acc"], fmt="{:.1%}"))
     print()
-    print(f"  AR per-dim L1 first step: {np.array2string(ar_s['first_l1'], precision=4)}")
-    print(f"  TF per-dim L1 first step: {np.array2string(tf_s['first_l1'], precision=4)}")
+    print(f"  TRAIN per-dim L1 first step: {np.array2string(train_s['first_l1'], precision=4)}")
+    print(f"  EVAL  per-dim L1 first step: {np.array2string(eval_s['first_l1'], precision=4)}")
     print()
 
-    # Verdict: read the AR-vs-TF gap, not just AR alone.
+    # Verdict: read the TRAIN-vs-EVAL gap, not just one column alone.
     GOOD_BIN = 0.85
     GOOD_REL = 0.03
     UNTRAINED_BIN = 0.40
 
-    ar_good = ar_s["bin_acc"] > GOOD_BIN and ar_s["rel"].mean() < GOOD_REL
-    tf_good = tf_s["bin_acc"] > GOOD_BIN and tf_s["rel"].mean() < GOOD_REL
-    tf_bad = tf_s["bin_acc"] < UNTRAINED_BIN
+    train_good = train_s["bin_acc"] > GOOD_BIN and train_s["rel"].mean() < GOOD_REL
+    eval_good = eval_s["bin_acc"] > GOOD_BIN and eval_s["rel"].mean() < GOOD_REL
+    train_bad = train_s["bin_acc"] < UNTRAINED_BIN
 
     print("verdict:")
-    if ar_good and tf_good:
-        print("  model is well-trained under both modes. Failure is in the eval contract")
-        print("  (preprocessing / gripper rescale / open-loop chunking).")
+    if train_good and eval_good:
+        print("  model is well-trained and both code paths agree. The eval failure is")
+        print("  in the rollout CONTRACT, not the model: sim->image preprocessing,")
+        print("  gripper rescale, or open-loop chunk length.")
         print("  Try --exec-chunk-len 1 in eval_libero.py, then --save-video.")
-    elif tf_good and not ar_good:
-        print("  EXPOSURE BIAS: model fits under teacher forcing but its own outputs walk")
-        print("  off-distribution under autoregressive decode. This matches the")
-        print("  'train acc high, eval 0%' pattern in CLAUDE.md.")
-        print("  Mitigations: shorter --chunk-size, scheduled sampling during training,")
-        print("  or --exec-chunk-len 1 at eval (re-plan from real obs every step).")
-    elif tf_bad:
+    elif train_good and not eval_good:
+        print("  CODE-PATH DIVERGENCE: forward() fits the training samples but predict()")
+        print("  does not, on the SAME inputs. The eval path does something the train")
+        print("  path doesn't — tokenization, padding, attention mask, or image")
+        print("  preprocessing. Diff NanoVLA.predict() against NanoVLA.forward().")
+    elif train_bad:
         print("  model is essentially untrained on this data — even the train-style")
-        print("  teacher-forced bin accuracy is low. Don't blame the eval.")
+        print("  forward() bin accuracy is low. Don't blame the eval.")
         print("  Check: was the right ckpt loaded? Did train act_acc actually reach >70%?")
         print("  If both yes, raise --lr (1e-4..5e-4), bigger --batch-size or --grad-accum,")
         print("  and consider --no-freeze-vision.")
     else:
-        print("  partially trained under teacher forcing, AR worse than TF.")
-        print("  Train longer / higher LR, and consider --exec-chunk-len 1 at eval.")
+        print("  partial / mixed result — train and eval paths disagree but neither is")
+        print("  cleanly good or bad. Re-run with more --num-samples; if it persists,")
+        print("  diff predict() against forward() and check the ckpt.")
 
 
 if __name__ == "__main__":
