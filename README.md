@@ -4,7 +4,7 @@
 
 ## Overview
 
-A single-file-readable Vision-Language-Action model in the spirit of [nanoGPT](https://github.com/karpathy/nanoGPT). **~1090 lines of Python** across six files — no Trainer / Lightning / Accelerate, no Hydra, no TFDS / RLDS / OXE pipeline. One `@dataclass` at the top of `train.py`. Trains on a LIBERO suite in a few GPU-hours; measured per-suite success rates (58–82%) are in [Results](#results).
+A single-file-readable Vision-Language-Action model in the spirit of [nanoGPT](https://github.com/karpathy/nanoGPT). **~1090 lines of Python** across six files — no Trainer / Lightning / Accelerate, no Hydra, no TFDS / RLDS / OXE pipeline. One `@dataclass` at the top of `train.py`. Trains on a LIBERO suite in a few GPU-hours; measured per-suite success rates (36–88%) are in [Results](#results).
 
 A teaching artifact, not a SOTA chase. v1 covers the discrete-token / nanoGPT-style design point — actions as LM vocabulary, single unified transformer — with one deliberate departure from base OpenVLA (see *Parallel action decoding* below). A follow-up will add small single-file variants for other rows of the design-space chart (e.g. flow-matching, continuous-regression). For the chart, per-system comparison (OpenVLA / MiniVLA / π0 / π0-FAST / GR00T N1 / RDT-1B), v2 roadmap, expected numbers, and debugging notes, see [DETAIL.md](./DETAIL.md).
 
@@ -73,17 +73,26 @@ Every field of `TrainConfig` (top of `train.py`) is auto-exposed as a CLI flag; 
 
 A separate nanoVLA checkpoint was trained per suite (single agentview camera, parallel decoding, 80k steps) and evaluated with the `eval_libero.py` sim harness at 5 trials per task:
 
-| Suite | Tasks × trials | Success rate |
-|---|---:|---:|
-| LIBERO-Spatial | 10 × 5 | 58% |
-| LIBERO-Object | 10 × 5 | 82% |
-| LIBERO-Goal | 10 × 5 | 66% |
-| LIBERO-10 (long-horizon) | 10 × 5 | 42% |
-| LIBERO-90 | 90 × 5 | 77% |
+| Suite | Tasks × trials | Success rate (`ckpt_last`) | Best in per-step sweep |
+|---|---:|---:|---:|
+| LIBERO-Spatial | 10 × 5 | 62% | **77% @ step 70k** (30 trials) |
+| LIBERO-Object | 10 × 5 | 88% | — |
+| LIBERO-Goal | 10 × 5 | 78% | **80% @ step 30k** (30 trials) |
+| LIBERO-10 (long-horizon) | 10 × 5 | 36% | — |
+| LIBERO-90 | 90 × 5 | 76% | — |
 
-Per-task breakdowns are in [`eval_results/`](./eval_results/). At 5 trials/task these are ballpark numbers, not leaderboard entries — expect ±10% run-to-run.
+Per-task breakdowns and the per-step sweep are in [`eval_results/`](./eval_results/); `verify_eval_results.py` recomputes each file's overall rate from its per-task counts. At 5 trials/task these are ballpark numbers, not leaderboard entries — expect ±10% run-to-run.
 
-**Caveat: these are `ckpt_last` (step 80k) numbers, which for the small suites is well past the overfitting peak.** LIBERO-Spatial / Object / Goal / 10 each have only ~500 demo episodes; at 80k steps × batch 64 the model memorizes them — train `act_acc` reaches 1.000 and loss falls to ~1e-3 (for LIBERO-Spatial, by ~step 50k). LIBERO-90 (~4500 episodes) can't be memorized in the same budget: it plateaus at train `act_acc` ≈ 0.70 and, not coincidentally, generalizes best. For the small suites an earlier checkpoint (≈ step 25k–40k) will usually eval higher than `ckpt_last`, and the step budget should scale with dataset size rather than being a flat 80k. LIBERO-Spatial is hit hardest because all 10 of its tasks share one instruction template over visually identical black bowls — language is the only disambiguator, so a memorizing model that leans on visual priors grabs the wrong bowl at eval. `sanity_replay.py --instruction-mode scramble` measures how much the policy actually uses the instruction; see [DETAIL.md](./DETAIL.md#expected-numbers) for the broader failure-mode checklist.
+**Caveat: these are `ckpt_last` (step 80k) numbers, which for the small suites is well past the overfitting peak.** LIBERO-Spatial / Object / Goal / 10 each have only ~500 demo episodes; at 80k steps × batch 64 the model memorizes them — train `act_acc` reaches 1.000 and loss falls to ~1e-3 (for LIBERO-Spatial, by ~step 50k). LIBERO-90 (~4500 episodes) can't be memorized in the same budget: it plateaus at train `act_acc` ≈ 0.70. For the small suites an earlier checkpoint usually eval-beats `ckpt_last`, but *which* one varies per suite — Goal peaks at ~30k, Spatial at ~70k (see `eval_results/sweep/_best_steps.json`). LIBERO-Spatial is hit hardest because all 10 of its tasks share one instruction template over visually identical black bowls — language is the only disambiguator, so a memorizing model that leans on visual priors grabs the wrong bowl at eval. `sanity_replay.py --instruction-mode scramble` measures how much the policy actually uses the instruction; see [DETAIL.md](./DETAIL.md#expected-numbers) for the broader failure-mode checklist.
+
+**Chunk size matters at eval.** A diagnostic sweep over `--chunk-size ∈ {1,2,4,8}` against the best step of each suite (50 trials/run, `eval_results/diag/`) shows chunking helps a lot on temporally extended tasks but can over-commit on visually ambiguous ones:
+
+| Suite (best step) | K=1 | K=2 | K=4 | K=8 |
+|---|---:|---:|---:|---:|
+| LIBERO-Goal @ 30k | 48% | 58% | 70% | **76%** |
+| LIBERO-Spatial @ 70k | 60% | 60% | **70%** | 64% |
+
+K=8 is the training default; lowering K at rollout (no retrain) is a free knob on suites where the model commits to the wrong sub-goal mid-chunk.
 
 ## Data format
 
