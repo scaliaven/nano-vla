@@ -138,7 +138,8 @@ def main():
     ap.add_argument("--image-size", type=int, default=224)
     ap.add_argument("--render-size", type=int, default=256,
                     help="sim camera height/width; match training source resolution")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="base seed; each rollout is seeded from (seed, task_id, trial)")
     ap.add_argument("--out", type=Path, default=Path("eval_results.json"))
     ap.add_argument("--save-video", type=Path, default=None,
                     help="if set, dump per-rollout mp4s here (one file per trial)")
@@ -151,7 +152,6 @@ def main():
     if args.max_steps is None:
         args.max_steps = {"libero_10": 600, "libero_90": 600}.get(args.suite, 300)
 
-    np.random.seed(args.seed)
     if args.policy == "random":
         policy = RandomPolicy()
         gripper_rescale = False
@@ -183,6 +183,13 @@ def main():
         succ = 0
         pbar = tqdm(range(n), desc=f"[{task_id:02d}] {task.language[:40]}")
         for i in pbar:
+            # Per-trial deterministic seed: each (task_id, trial) is reproducible
+            # independent of --num-trials, task order, or partial reruns. A single
+            # global seed instead chains each rollout onto every prior rollout's
+            # RNG draws, so changing --num-trials silently shifts later results.
+            np.random.seed(
+                int(np.random.SeedSequence([args.seed, task_id, i]).generate_state(1)[0])
+            )
             frames = [] if args.save_video is not None else None
             ok = rollout(env, policy, task.language, init_states[i],
                          args.max_steps, args.image_size,
